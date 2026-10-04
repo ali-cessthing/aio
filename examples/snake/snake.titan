@@ -120,7 +120,7 @@ fn place_food(body: [int], seed: int) -> [int] {
         c = s % total
         tries = tries + 1
     }
-    [c, s]
+    return [c, s]
 }
 
 fn tick_ms(score: int) -> int {
@@ -133,7 +133,7 @@ fn fresh(mark: int, phase: int, best: int, seed: int, now: int) -> [[int]] {
     let body = [mid, mid + cols(), mid + cols() * 2, mid + cols() * 3]
     let food = place_food(body, seed + now)
     let header = [mark, phase, 0, 0, food[0], 0, best, food[1], now, 0 - 10000, 0, 0 - 10000, 0, 0, 0, now]
-    [header, body]
+    return [header, body]
 }
 
 // Llamado por el host una sola vez tras `main`.
@@ -161,7 +161,7 @@ fn steer(state: [[int]], d: int) -> [[int]] {
     if h[h_next()] == d {
         return state
     }
-    [put(h, h_next(), d), state[1]]
+    return [put(h, h_next(), d), state[1]]
 }
 
 // ------------------------------------------------------------- mensajes
@@ -259,7 +259,7 @@ fn step(state: [[int]], now: int) -> [[int]] {
 
     let moved = std::array::concat([target], std::array::slice(body, 0, n - 1))
     let h2 = put(put(h, h_dir(), d), h_last(), now)
-    [h2, moved]
+    return [h2, moved]
 }
 
 // Avanza la lógica según el reloj y dibuja el cuadro.
