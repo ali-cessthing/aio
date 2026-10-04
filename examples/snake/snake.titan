@@ -1,0 +1,571 @@
+// ============================================================================
+//  TITAN SNAKE ─ juego neón para el navegador, escrito 100 % en TITAN.
+//
+//  Compilar a WebAssembly y servir:
+//      zett wasm examples/snake/snake.titan --output examples/snake/program.wasm
+//      cd examples/snake && python3 -m http.server 8080
+//  y abrir http://localhost:8080 (también desde el navegador del teléfono).
+//
+//  Arquitectura (estilo Elm, sin variables globales):
+//    · `init(now)`        crea el estado inicial del juego.
+//    · `update(state,msg)` aplica un mensaje de entrada (tecla, toque, swipe).
+//    · `frame(state,now)`  avanza la lógica y DIBUJA el cuadro en el Canvas.
+//  El estado es un valor inmutable `[cabecera, cuerpo]` que el host
+//  JavaScript sólo guarda y devuelve: toda la lógica y el dibujo son TITAN.
+//  Los manejadores de eventos (`on_key`, `on_down`, ...) devuelven un
+//  mensaje entero; el host se lo entrega a `update`.
+// ============================================================================
+
+// ---------------------------------------------------------------- constantes
+fn cols() -> int { 18 }
+fn rows() -> int { 26 }
+fn cell() -> int { 40 }
+fn board_y() -> int { 170 }
+fn width() -> int { 720 }
+fn height() -> int { 1280 }
+
+// Índices de la cabecera del estado.
+fn h_mark() -> int { 0 }        // checkpoint del heap para reciclar memoria
+fn h_phase() -> int { 1 }       // 0 = portada, 1 = jugando, 2 = game over
+fn h_dir() -> int { 2 }         // dirección actual (0 ↑, 1 →, 2 ↓, 3 ←)
+fn h_next() -> int { 3 }        // dirección pedida para el próximo paso
+fn h_food() -> int { 4 }        // celda de la comida
+fn h_score() -> int { 5 }
+fn h_best() -> int { 6 }
+fn h_seed() -> int { 7 }        // semilla del generador pseudoaleatorio
+fn h_last() -> int { 8 }        // instante del último paso lógico (ms)
+fn h_eat_t() -> int { 9 }       // instante en que comió (para partículas)
+fn h_eat_c() -> int { 10 }      // celda donde comió
+fn h_dead_t() -> int { 11 }     // instante de la muerte (sacudida / flash)
+fn h_down_x() -> int { 12 }     // inicio del gesto táctil
+fn h_down_y() -> int { 13 }
+fn h_down_on() -> int { 14 }
+fn h_start_t() -> int { 15 }
+
+// Tipos de mensaje: tipo * 100000000 + a * 10000 + b
+fn msg_dir() -> int { 1 }
+fn msg_down() -> int { 2 }
+fn msg_up() -> int { 3 }
+fn msg_move() -> int { 4 }
+fn msg_start() -> int { 5 }
+
+fn encode(kind: int, a: int, b: int) -> int {
+    kind * 100000000 + iclamp(a, 0, 9999) * 10000 + iclamp(b, 0, 9999)
+}
+
+// ------------------------------------------------------------- utilidades
+fn iclamp(v: int, lo: int, hi: int) -> int {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    v
+}
+
+fn iabs(v: int) -> int {
+    if v < 0 { return 0 - v }
+    v
+}
+
+fn imax(a: int, b: int) -> int {
+    if a > b { return a }
+    b
+}
+
+fn dx(d: int) -> int {
+    if d == 1 { return 1 }
+    if d == 3 { return 0 - 1 }
+    0
+}
+
+fn dy(d: int) -> int {
+    if d == 0 { return 0 - 1 }
+    if d == 2 { return 1 }
+    0
+}
+
+fn next_seed(seed: int) -> int {
+    (seed * 1103515245 + 12345) % 2147483648
+}
+
+// Hash entero barato para efectos visuales deterministas.
+fn mix(n: int) -> int {
+    let mut x = (n * 2654435761) % 4294967296
+    x = (x / 65536 + x * 31) % 1000003
+    iabs(x)
+}
+
+fn put(h: [int], index: int, value: int) -> [int] {
+    std::array::set(h, index, value)
+}
+
+fn contains(body: [int], target: int, limit: int) -> bool {
+    let mut i = 0
+    let mut found = false
+    while i < limit {
+        if body[i] == target {
+            found = true
+        }
+        i = i + 1
+    }
+    found
+}
+
+// Busca una celda libre para la comida; devuelve [celda, nueva_semilla].
+fn place_food(body: [int], seed: int) -> [int] {
+    let total = cols() * rows()
+    let mut s = next_seed(seed)
+    let mut c = s % total
+    let mut tries = 0
+    while tries < 200 && contains(body, c, len(body)) {
+        s = next_seed(s)
+        c = s % total
+        tries = tries + 1
+    }
+    [c, s]
+}
+
+fn tick_ms(score: int) -> int {
+    imax(62, 150 - score * 4)
+}
+
+// ---------------------------------------------------------------- estado
+fn fresh(mark: int, phase: int, best: int, seed: int, now: int) -> [[int]] {
+    let mid = (rows() / 2) * cols() + cols() / 2
+    let body = [mid, mid + cols(), mid + cols() * 2, mid + cols() * 3]
+    let food = place_food(body, seed + now)
+    let header = [mark, phase, 0, 0, food[0], 0, best, food[1], now, 0 - 10000, 0, 0 - 10000, 0, 0, 0, now]
+    [header, body]
+}
+
+// Llamado por el host una sola vez tras `main`.
+fn init(now: int) -> [[int]] {
+    let mark = std::wasm::heap_checkpoint()
+    fresh(mark, 0, 0, 7919, now)
+}
+
+// Reinicia la partida reciclando TODA la memoria de la partida anterior.
+fn start_game(state: [[int]], now: int) -> [[int]] {
+    let h = state[0]
+    let mark = h[h_mark()]
+    let best = imax(h[h_best()], h[h_score()])
+    let seed = h[h_seed()]
+    std::wasm::heap_restore(mark)
+    fresh(mark, 1, best, seed, now)
+}
+
+fn steer(state: [[int]], d: int) -> [[int]] {
+    let h = state[0]
+    let cur = h[h_dir()]
+    if (cur + 2) % 4 == d {
+        return state
+    }
+    if h[h_next()] == d {
+        return state
+    }
+    [put(h, h_next(), d), state[1]]
+}
+
+// ------------------------------------------------------------- mensajes
+fn update(state: [[int]], msg: int, now: int) -> [[int]] {
+    let kind = msg / 100000000
+    let a = (msg / 10000) % 10000
+    let b = msg % 10000
+    let h = state[0]
+    let phase = h[h_phase()]
+    let can_start = phase == 0 || (phase == 2 && now - h[h_dead_t()] > 600)
+
+    if kind == msg_start() {
+        if can_start { return start_game(state, now) }
+        return state
+    }
+    if kind == msg_dir() {
+        if phase == 1 { return steer(state, a) }
+        if can_start { return steer(start_game(state, now), a) }
+        return state
+    }
+    if kind == msg_down() {
+        let h2 = put(put(put(h, h_down_x(), a), h_down_y(), b), h_down_on(), 1)
+        return [h2, state[1]]
+    }
+    if kind == msg_move() {
+        if h[h_down_on()] == 0 { return state }
+        let ddx = a - h[h_down_x()]
+        let ddy = b - h[h_down_y()]
+        if iabs(ddx) < 28 && iabs(ddy) < 28 { return state }
+        let mut d = 0
+        if iabs(ddx) > iabs(ddy) {
+            if ddx > 0 { d = 1 } else { d = 3 }
+        } else {
+            if ddy > 0 { d = 2 } else { d = 0 }
+        }
+        // El gesto continúa desde aquí: permite encadenar giros sin soltar.
+        let h2 = put(put(put(h, h_down_x(), a), h_down_y(), b), h_down_on(), 2)
+        let moved = [h2, state[1]]
+        if phase == 1 { return steer(moved, d) }
+        return moved
+    }
+    if kind == msg_up() {
+        let was = h[h_down_on()]
+        let released = [put(h, h_down_on(), 0), state[1]]
+        if was == 1 && can_start {
+            return start_game(released, now)
+        }
+        return released
+    }
+    state
+}
+
+// ---------------------------------------------------------- lógica (paso)
+fn step(state: [[int]], now: int) -> [[int]] {
+    let h = state[0]
+    let body = state[1]
+    let d = h[h_next()]
+    let head = body[0]
+    let nx = head % cols() + dx(d)
+    let ny = head / cols() + dy(d)
+    let n = len(body)
+
+    let mut dead = false
+    if nx < 0 || nx >= cols() || ny < 0 || ny >= rows() {
+        dead = true
+    }
+    let target = ny * cols() + nx
+    let food = h[h_food()]
+    let eating = target == food
+    if !dead {
+        // La cola se mueve en este paso salvo que estemos comiendo.
+        let mut limit = n - 1
+        if eating { limit = n }
+        if contains(body, target, limit) { dead = true }
+    }
+
+    if dead {
+        let score = h[h_score()]
+        let h2 = put(put(put(h, h_phase(), 2), h_dead_t(), now), h_best(), imax(h[h_best()], score))
+        return [h2, body]
+    }
+
+    if eating {
+        let grown = std::array::concat([target], body)
+        let spot = place_food(grown, h[h_seed()] + now)
+        let mut h2 = put(h, h_dir(), d)
+        h2 = put(h2, h_score(), h[h_score()] + 1)
+        h2 = put(h2, h_food(), spot[0])
+        h2 = put(h2, h_seed(), spot[1])
+        h2 = put(h2, h_eat_t(), now)
+        h2 = put(h2, h_eat_c(), food)
+        h2 = put(h2, h_last(), now)
+        return [h2, grown]
+    }
+
+    let moved = std::array::concat([target], std::array::slice(body, 0, n - 1))
+    let h2 = put(put(h, h_dir(), d), h_last(), now)
+    [h2, moved]
+}
+
+// Avanza la lógica según el reloj y dibuja el cuadro.
+fn frame(state: [[int]], now: int) -> [[int]] {
+    let h = state[0]
+    let mut next = state
+    if h[h_phase()] == 1 {
+        let interval = tick_ms(h[h_score()])
+        if now - h[h_last()] >= interval {
+            next = step(state, now)
+        }
+    }
+    draw(next, now)
+    next
+}
+
+// ================================================================== dibujo
+fn cv() -> string { "#game" }
+
+fn rect(x: int, y: int, w: int, hh: int, color: string) -> int {
+    std::web::canvas_fill_rect(cv(), x, y, w, hh, color)
+    0
+}
+
+fn digit(d: int) -> string {
+    if d == 0 { return "0" }
+    if d == 1 { return "1" }
+    if d == 2 { return "2" }
+    if d == 3 { return "3" }
+    if d == 4 { return "4" }
+    if d == 5 { return "5" }
+    if d == 6 { return "6" }
+    if d == 7 { return "7" }
+    if d == 8 { return "8" }
+    "9"
+}
+
+fn digits(n: int) -> int {
+    let mut count = 1
+    let mut v = n / 10
+    while v > 0 {
+        count = count + 1
+        v = v / 10
+    }
+    count
+}
+
+// Dibuja un número dígito a dígito (sin reservar memoria) con fuente
+// monoespaciada; `x` es el borde izquierdo y `adv` el avance por dígito.
+fn number(n: int, x: int, y: int, adv: int, color: string, font: string) -> int {
+    let count = digits(n)
+    let mut v = n
+    let mut i = count - 1
+    while i >= 0 {
+        std::web::canvas_text(cv(), digit(v % 10), x + i * adv, y, color, font)
+        v = v / 10
+        i = i - 1
+    }
+    0
+}
+
+// Texto centrado aproximado: la fuente monoespaciada avanza ~0.6 × tamaño.
+fn centered(text: string, cy: int, size: int, color: string, font: string, ox: int) -> int {
+    let w = len(text) * size * 6 / 10
+    std::web::canvas_text(cv(), text, width() / 2 - w / 2 + ox, cy, color, font)
+    0
+}
+
+fn snake_color(i: int, n: int) -> string {
+    let band = i * 6 / imax(n, 1)
+    if band == 0 { return "#3dffb5" }
+    if band == 1 { return "#22f0c8" }
+    if band == 2 { return "#14d9e0" }
+    if band == 3 { return "#14bdf0" }
+    if band == 4 { return "#2b9cff" }
+    "#4d7dff"
+}
+
+fn background(ox: int, oy: int, now: int) -> int {
+    std::web::canvas_clear(cv(), "#05060d")
+    // Halo de color detrás del tablero.
+    rect(0, board_y() - 20 + oy, width(), rows() * cell() + 40, "#070a18")
+    let mut c = 0
+    while c <= cols() {
+        let x = c * cell() + ox
+        std::web::canvas_line(cv(), x, board_y() + oy, x, board_y() + rows() * cell() + oy, "rgba(90,120,255,0.07)", 1)
+        c = c + 1
+    }
+    let mut r = 0
+    while r <= rows() {
+        let y = board_y() + r * cell() + oy
+        std::web::canvas_line(cv(), ox, y, width() + ox, y, "rgba(90,120,255,0.07)", 1)
+        r = r + 1
+    }
+    // Línea de escaneo que recorre el tablero.
+    let scan = board_y() + (now / 9) % (rows() * cell())
+    rect(0, scan + oy, width(), 3, "rgba(61,255,181,0.05)")
+    // Marco neón.
+    std::web::canvas_stroke_rect(cv(), 2 + ox, board_y() - 2 + oy, width() - 4, rows() * cell() + 4, "rgba(61,255,181,0.35)", 3)
+    0
+}
+
+fn hud(h: [int], now: int) -> int {
+    let font_title = "bold 30px ui-monospace, Menlo, Consolas, monospace"
+    std::web::canvas_text(cv(), "TITAN", 28, 62, "#3dffb5", font_title)
+    std::web::canvas_text(cv(), "SNAKE", 136, 62, "#ff3df0", font_title)
+    std::web::canvas_text(cv(), "WASM", 248, 62, "rgba(255,255,255,0.35)", "bold 16px ui-monospace, Menlo, monospace")
+
+    std::web::canvas_text(cv(), "PUNTOS", 28, 104, "rgba(255,255,255,0.45)", "bold 18px ui-monospace, Menlo, monospace")
+    number(h[h_score()], 28, 152, 33, "#ffffff", "bold 54px ui-monospace, Menlo, Consolas, monospace")
+
+    let best = imax(h[h_best()], h[h_score()])
+    std::web::canvas_text(cv(), "RÉCORD", 560, 104, "rgba(255,255,255,0.45)", "bold 18px ui-monospace, Menlo, monospace")
+    let bx = 692 - digits(best) * 22
+    number(best, bx, 148, 22, "#ffd23d", "bold 36px ui-monospace, Menlo, Consolas, monospace")
+
+    // Barra de velocidad.
+    let speed = (150 - tick_ms(h[h_score()])) * 100 / 88
+    std::web::canvas_text(cv(), "VEL", 380, 104, "rgba(255,255,255,0.45)", "bold 18px ui-monospace, Menlo, monospace")
+    rect(380, 122, 140, 14, "rgba(255,255,255,0.08)")
+    rect(380, 122, 14 + speed * 126 / 100, 14, "#ff3df0")
+    0
+}
+
+fn draw_food(h: [int], ox: int, oy: int, now: int) -> int {
+    let food = h[h_food()]
+    let fx = (food % cols()) * cell() + ox
+    let fy = board_y() + (food / cols()) * cell() + oy
+    let tri = (now / 25) % 20
+    let mut pulse = tri
+    if tri > 10 { pulse = 20 - tri }
+    let g = 10 + pulse
+    rect(fx - g, fy - g, cell() + g * 2, cell() + g * 2, "rgba(255,61,240,0.08)")
+    rect(fx - g / 2, fy - g / 2, cell() + g, cell() + g, "rgba(255,61,240,0.16)")
+    rect(fx + 6, fy + 6, cell() - 12, cell() - 12, "#ff3df0")
+    rect(fx + 12, fy + 12, cell() - 24, cell() - 24, "#ffd0fb")
+    0
+}
+
+fn draw_snake(state: [[int]], ox: int, oy: int, dead: bool) -> int {
+    let h = state[0]
+    let body = state[1]
+    let n = len(body)
+    let mut i = n - 1
+    while i >= 0 {
+        let c = body[i]
+        let x = (c % cols()) * cell() + ox
+        let y = board_y() + (c / cols()) * cell() + oy
+        let mut color = snake_color(i, n)
+        if dead { color = "#ff4d6d" }
+        rect(x - 4, y - 4, cell() + 8, cell() + 8, "rgba(61,255,200,0.07)")
+        let inset = 3 + (i * 6) / imax(n, 1)
+        rect(x + inset, y + inset, cell() - inset * 2, cell() - inset * 2, color)
+        rect(x + inset, y + inset, cell() - inset * 2, 4, "rgba(255,255,255,0.25)")
+        i = i - 1
+    }
+    // Ojos orientados según la dirección.
+    let head = body[0]
+    let hx = (head % cols()) * cell() + ox
+    let hy = board_y() + (head / cols()) * cell() + oy
+    let d = h[h_dir()]
+    let mut e1x = hx + 9
+    let mut e1y = hy + 9
+    let mut e2x = hx + 23
+    let mut e2y = hy + 9
+    if d == 1 {
+        e1x = hx + 23
+        e2y = hy + 23
+    }
+    if d == 2 {
+        e1y = hy + 23
+        e2y = hy + 23
+    }
+    if d == 3 {
+        e2x = hx + 9
+        e2y = hy + 23
+    }
+    rect(e1x, e1y, 8, 8, "#05060d")
+    rect(e2x, e2y, 8, 8, "#05060d")
+    0
+}
+
+// Explosión de partículas al comer, calculada a partir del tiempo (sin estado).
+fn particles(h: [int], ox: int, oy: int, now: int) -> int {
+    let age = now - h[h_eat_t()]
+    if age < 0 || age > 520 { return 0 }
+    let c = h[h_eat_c()]
+    let cx = (c % cols()) * cell() + cell() / 2 + ox
+    let cy = board_y() + (c / cols()) * cell() + cell() / 2 + oy
+    let mut k = 0
+    while k < 18 {
+        let r = mix(k * 7919 + h[h_eat_t()])
+        let vx = r % 200 - 100
+        let vy = (r / 200) % 200 - 100
+        let px = cx + vx * age / 260
+        let py = cy + vy * age / 260 + age * age / 9000
+        let size = 10 - age / 55
+        if size > 0 {
+            if k % 2 == 0 {
+                rect(px - size / 2, py - size / 2, size, size, "#ff3df0")
+            } else {
+                rect(px - size / 2, py - size / 2, size, size, "#3dffb5")
+            }
+        }
+        k = k + 1
+    }
+    // "+1" flotante.
+    std::web::canvas_text(cv(), "+1", cx - 16, cy - 20 - age / 12, "#ffd23d", "bold 30px ui-monospace, Menlo, monospace")
+    0
+}
+
+fn panel(top: int, hh: int) -> int {
+    rect(60, top, 600, hh, "rgba(5,6,13,0.86)")
+    std::web::canvas_stroke_rect(cv(), 60, top, 600, hh, "rgba(255,61,240,0.6)", 3)
+    0
+}
+
+fn title_screen(h: [int], now: int) -> int {
+    panel(380, 520)
+    let bob = iabs((now / 30) % 20 - 10)
+    centered("TITAN", 500 + bob, 96, "#3dffb5", "bold 96px ui-monospace, Menlo, Consolas, monospace", 0)
+    centered("SNAKE", 600 - bob, 96, "#ff3df0", "bold 96px ui-monospace, Menlo, Consolas, monospace", 0)
+    centered("hecho en TITAN · WebAssembly", 660, 22, "rgba(255,255,255,0.55)", "22px ui-monospace, Menlo, monospace", 0)
+    centered("Desliza el dedo para girar", 740, 26, "#ffffff", "26px ui-monospace, Menlo, monospace", 0)
+    centered("o usa flechas / WASD", 780, 26, "rgba(255,255,255,0.7)", "26px ui-monospace, Menlo, monospace", 0)
+    if (now / 500) % 2 == 0 {
+        centered("TOCA PARA EMPEZAR", 856, 34, "#ffd23d", "bold 34px ui-monospace, Menlo, monospace", 0)
+    }
+    0
+}
+
+fn game_over(h: [int], now: int) -> int {
+    panel(420, 440)
+    centered("GAME OVER", 520, 72, "#ff4d6d", "bold 72px ui-monospace, Menlo, Consolas, monospace", 0)
+    centered("PUNTOS", 590, 24, "rgba(255,255,255,0.55)", "bold 24px ui-monospace, Menlo, monospace", 0)
+    let score = h[h_score()]
+    number(score, 360 - digits(score) * 24, 670, 48, "#ffffff", "bold 80px ui-monospace, Menlo, Consolas, monospace")
+    if score >= h[h_best()] && score > 0 {
+        centered("¡NUEVO RÉCORD!", 730, 30, "#ffd23d", "bold 30px ui-monospace, Menlo, monospace", 0)
+    }
+    if now - h[h_dead_t()] > 600 && (now / 500) % 2 == 0 {
+        centered("TOCA PARA REINTENTAR", 810, 32, "#3dffb5", "bold 32px ui-monospace, Menlo, monospace", 0)
+    }
+    0
+}
+
+fn draw(state: [[int]], now: int) -> int {
+    let h = state[0]
+    let phase = h[h_phase()]
+
+    // Sacudida de pantalla durante 350 ms tras morir.
+    let mut ox = 0
+    let mut oy = 0
+    let since_death = now - h[h_dead_t()]
+    if phase == 2 && since_death < 350 {
+        let amp = 14 - since_death / 25
+        let r = mix(now)
+        ox = r % (amp * 2 + 1) - amp
+        oy = (r / 97) % (amp * 2 + 1) - amp
+    }
+
+    background(ox, oy, now)
+    hud(h, now)
+    draw_food(h, ox, oy, now)
+    draw_snake(state, ox, oy, phase == 2)
+    particles(h, ox, oy, now)
+
+    if phase == 2 && since_death < 160 {
+        rect(0, 0, width(), height(), "rgba(255,40,80,0.28)")
+    }
+
+    let hint = "desliza · flechas · WASD"
+    centered(hint, 1252, 22, "rgba(255,255,255,0.35)", "22px ui-monospace, Menlo, monospace", 0)
+
+    if phase == 0 { title_screen(h, now) }
+    if phase == 2 { game_over(h, now) }
+    0
+}
+
+// ============================================================ eventos DOM
+// Cada manejador devuelve un mensaje (0 = ignorar) que el host pasa a `update`.
+fn key_is(key: string, a: string, b: string, c: string) -> bool {
+    std::text::equals(key, a) || std::text::equals(key, b) || std::text::equals(key, c)
+}
+
+fn on_key() -> int {
+    let key = std::web::event_key()
+    if key_is(key, "ArrowUp", "w", "W") { return encode(msg_dir(), 0, 0) }
+    if key_is(key, "ArrowRight", "d", "D") { return encode(msg_dir(), 1, 0) }
+    if key_is(key, "ArrowDown", "s", "S") { return encode(msg_dir(), 2, 0) }
+    if key_is(key, "ArrowLeft", "a", "A") { return encode(msg_dir(), 3, 0) }
+    if key_is(key, " ", "Enter", "Spacebar") { return encode(msg_start(), 0, 0) }
+    0
+}
+
+fn on_down() -> int { encode(msg_down(), std::web::event_x(), std::web::event_y()) }
+fn on_move() -> int { encode(msg_move(), std::web::event_x(), std::web::event_y()) }
+fn on_up() -> int { encode(msg_up(), std::web::event_x(), std::web::event_y()) }
+
+fn main() {
+    std::web::set_title("TITAN Snake")
+    std::web::canvas_resize(cv(), width(), height())
+    std::web::listen("body", "keydown", "on_key")
+    std::web::listen(cv(), "pointerdown", "on_down")
+    std::web::listen(cv(), "pointermove", "on_move")
+    std::web::listen(cv(), "pointerup", "on_up")
+    std::web::listen(cv(), "pointercancel", "on_up")
+    0
+}
