@@ -1,5 +1,7 @@
 # TITAN Server Lifecycle and Backpressure
 
+`std::server::accept(handle, timeout_ms)` waits up to `timeout_ms` milliseconds for one TCP connection and returns `-1` when the deadline expires. The runtime caps this value at 30000 ms (`MAX_ACCEPT_TIMEOUT_MS` in `titan_stdlib/src/server_mod.rs`): larger values fail with a typed resource-limit error instead of blocking longer, so accept loops must pass 30000 or less.
+
 `std::server::control(maximum_connections)` creates a shared lifecycle handle. Before spawning a connection task, call `try_acquire`; false means the server is draining or at capacity and should reject/close the accepted socket. Every acquired slot must call `release` when its connection task ends.
 
 `shutdown(control)` atomically stops new acquisitions while existing tasks drain. `stats(control)` returns maximum, active, accepted, rejected, completed, ready, healthy and shutting_down. All state uses atomics; acquisition uses compare-exchange, so concurrent accept loops cannot exceed the configured maximum.

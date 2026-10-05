@@ -94,11 +94,13 @@ fn main() {
     print("  curl http://127.0.0.1:8080/api/users/42")
     print("  curl -X POST -d 'hola' http://127.0.0.1:8080/echo")
     print("  curl http://127.0.0.1:8080/files/a/b/c.txt")
-    print("---- Aceptando hasta 20 requests (60s timeout c/u) ----")
+    // El runtime acota el timeout de accept a 30000 ms (MAX_ACCEPT_TIMEOUT_MS en
+    // titan_stdlib/server_mod.rs): un valor mayor falla con ResourceLimit.
+    print("---- Aceptando hasta 20 requests (30s timeout c/u) ----")
 
     // ---- 3) Loop de aceptacion ----
     for i in 0..20 {
-        let req = std::server::accept(s, 60000)
+        let req = std::server::accept(s, 30000)
         if req < 0 {
             print("timeout, saliendo")
         } else {

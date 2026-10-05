@@ -65,6 +65,20 @@ fn list_users(db: Sqlite) -> array {
     return rows
 }
 
+// Detalle de un usuario por id. No selecciona password_hash: el hash
+// nunca sale de la base de datos.
+fn find_user_by_id(db: Sqlite, user_id: string) -> any {
+    let rows = std::sqlite::query(
+        db,
+        "SELECT id, username, created_at FROM users WHERE id = ?",
+        [user_id]
+    )
+    if len(rows) == 0 {
+        return nil
+    }
+    return rows[0]
+}
+
 // ---------- Posts ----------
 
 fn create_post(db: Sqlite, user_id: string, title: string, body: string) -> map {
