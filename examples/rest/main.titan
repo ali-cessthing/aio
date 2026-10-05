@@ -176,6 +176,15 @@ fn handle_list_users(req: int, database: Sqlite) {
     json_response(req, 200, wrap)
 }
 
+fn handle_get_user(req: int, database: Sqlite, user_id: string) {
+    let user = find_user_by_id(database, user_id)
+    if user == nil {
+        error_response(req, 404, "user not found")
+        return
+    }
+    json_response(req, 200, user)
+}
+
 fn handle_list_posts(req: int, database: Sqlite) {
     let posts = list_posts(database)
     let wrap = std::map::new()
@@ -263,6 +272,11 @@ fn dispatch(r: int, database: Sqlite, req: int) {
         if met != "GET" { error_response(req, 405, "method not allowed"); return }
         handle_list_users(req, database); return
     }
+    if tag == "user_detail" {
+        let user_id = params.id
+        if met == "GET" { handle_get_user(req, database, user_id); return }
+        error_response(req, 405, "method not allowed"); return
+    }
     if tag == "posts_col" {
         if met == "GET"  { handle_list_posts(req, database); return }
         if met == "POST" { handle_create_post(req, database); return }
@@ -305,6 +319,7 @@ fn main() {
     print("  POST   /api/register            (publico)  body: {\"username\":\"x\",\"password\":\"y\"}")
     print("  POST   /api/login               (publico)  body: idem -> retorna JWT")
     print("  GET    /api/users               (publico)  lista de usuarios")
+    print("  GET    /api/users/<id>          (publico)  detalle de un usuario")
     print("  GET    /api/posts               (publico)  lista de posts")
     print("  GET    /api/posts/<id>          (publico)")
     print("  POST   /api/posts               (auth JWT) body: {\"title\":\"...\",\"body\":\"...\"}")
@@ -315,11 +330,11 @@ fn main() {
     print("               -H 'Content-Type: application/json' \\")
     print("               -d '{\"username\":\"alex\",\"password\":\"secret123\"}'")
     print("")
-    print("Aceptando hasta 40 requests (timeout 60s/c)...")
+    print("Aceptando hasta 40 requests (timeout 30s/c)...")
     print("")
 
     for i in 0..40 {
-        let req = std::server::accept(s, 60000)
+        let req = std::server::accept(s, 30000)
         if req < 0 {
             print("[server] timeout, saliendo del loop")
         } else {

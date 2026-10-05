@@ -39,7 +39,8 @@ fn main() {
 
     // Loop: acepta hasta 200 requests (~15 min con refresh 5s)
     for i in 0..200 {
-        let req = std::server::accept(s, 60000)
+        // 30000 es el maximo que acepta el runtime (MAX_ACCEPT_TIMEOUT_MS).
+        let req = std::server::accept(s, 30000)
         if req < 0 {
             print("timeout, sigo esperando...")
         } else {
